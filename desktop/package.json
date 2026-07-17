@@ -1,0 +1,12 @@
+{
+  "name": "visual-data-pipeline-desktop",
+  "version": "0.1.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}

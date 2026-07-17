@@ -1,0 +1,11 @@
+{
+  "name": "visual-data-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Visual Data Pipeline - MVP v0.1 - Capture and store screenshot pipeline",
+  "scripts": {
+    "install:all": "npm install --prefix frontend && npm install --prefix desktop",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "start:desktop": "npm start --prefix desktop"
+  }
+}

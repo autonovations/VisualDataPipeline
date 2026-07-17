@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: vdp-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - vdp_mongo_data:/data/db
+    restart: always
+
+volumes:
+  vdp_mongo_data:
+    driver: local
