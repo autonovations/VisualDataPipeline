@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  startCapture: (sessionId) => ipcRenderer.send('start-capture', sessionId),
+  startCapture: (config) => ipcRenderer.send('start-capture', config),
   stopCapture: () => ipcRenderer.send('stop-capture'),
   onScreenshot: (callback) => {
     const subscription = (event, data) => callback(event, data);

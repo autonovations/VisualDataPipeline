@@ -19,9 +19,9 @@ import {
 declare global {
   interface Window {
     electronAPI?: {
-      startCapture: (sessionId: string) => void;
+      startCapture: (config: { sessionId: string; scale: number; quality: number } | string) => void;
       stopCapture: () => void;
-      onScreenshot: (callback: (event: any, data: { image: string; url: string; timestamp: string }) => void) => () => void;
+      onScreenshot: (callback: (event: any, data: { image: string; url: string; timestamp: string; sequence?: number }) => void) => () => void;
       onWebviewNavigate: (callback: (event: any, url: string) => void) => () => void;
     };
   }
@@ -61,6 +61,67 @@ function App() {
   const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
   const wsRef = useRef<WebSocket | null>(null)
   const [isElectron, setIsElectron] = useState(false)
+  
+  // Custom pipeline config states
+  const [scale, setScale] = useState(0.5)
+  const [quality, setQuality] = useState(75)
+  const [viewportResolution, setViewportResolution] = useState('responsive')
+  
+  // Viewport container size tracker
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [containerSize, setContainerSize] = useState({ width: 800, height: 350 })
+
+  // ResizeObserver to track container height/width
+  useEffect(() => {
+    if (!containerRef.current) return
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setContainerSize({
+          width: entry.contentRect.width,
+          height: entry.contentRect.height,
+        })
+      }
+    })
+    observer.observe(containerRef.current)
+    return () => {
+      observer.disconnect()
+    }
+  }, [isCapturing])
+
+  // Get active webview dimensions
+  const getViewportDimensions = () => {
+    switch (viewportResolution) {
+      case '1280x800': return { width: 1280, height: 800 }
+      case '1920x1080': return { width: 1920, height: 1080 }
+      case '1280x720': return { width: 1280, height: 720 }
+      case '1024x768': return { width: 1024, height: 768 }
+      case '375x812': return { width: 375, height: 812 }
+      default: return null
+    }
+  }
+
+  const dims = getViewportDimensions()
+  const scaleX = dims ? containerSize.width / dims.width : 1
+  const scaleY = dims ? containerSize.height / dims.height : 1
+  const scaleFactor = dims ? Math.min(scaleX, scaleY, 1) : 1
+
+  const webviewStyle = dims ? {
+    width: `${dims.width}px`,
+    height: `${dims.height}px`,
+    transform: `scale(${scaleFactor})`,
+    transformOrigin: 'top left',
+    position: 'absolute' as const,
+    left: `${Math.max(0, (containerSize.width - dims.width * scaleFactor) / 2)}px`,
+    top: `${Math.max(0, (containerSize.height - dims.height * scaleFactor) / 2)}px`,
+    border: 'none',
+    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+    borderRadius: '4px',
+    overflow: 'hidden'
+  } : {
+    width: '100%',
+    height: '100%',
+    border: 'none',
+  }
   
   // Mock simulation for browser preview
   const mockIntervalRef = useRef<number | null>(null)
@@ -190,7 +251,8 @@ function App() {
           sessionId: activeSession.id,
           timestamp: data.timestamp,
           url: data.url,
-          image: data.image // already base64 encoded
+          image: data.image, // already base64 encoded
+          sequence: data.sequence
         }))
       }
 
@@ -250,8 +312,12 @@ function App() {
 
       // 2. Start Capture trigger
       if (isElectron && window.electronAPI) {
-        // Trigger Electron capture loop of the webview
-        window.electronAPI.startCapture(session.id)
+        // Trigger Electron capture loop of the webview with configs
+        window.electronAPI.startCapture({
+          sessionId: session.id,
+          scale: scale,
+          quality: quality
+        })
       } else {
         // Fallback: Web browser simulation mode
         startMockSimulation(session.id, targetUrl)
@@ -287,6 +353,11 @@ function App() {
   const startMockSimulation = (sessionId: string, url: string) => {
     if (mockIntervalRef.current) clearInterval(mockIntervalRef.current)
     
+    // Get target dimensions for simulated canvas
+    const currentDims = getViewportDimensions()
+    const canvasWidth = currentDims ? currentDims.width : 1280
+    const canvasHeight = currentDims ? currentDims.height : 800
+
     let simulatedCount = 0
     mockIntervalRef.current = window.setInterval(() => {
       simulatedCount++
@@ -294,26 +365,26 @@ function App() {
       
       // Generate a mock color canvas block base64 image representing a captured screenshot
       const canvas = document.createElement('canvas')
-      canvas.width = 400
-      canvas.height = 300
+      canvas.width = canvasWidth
+      canvas.height = canvasHeight
       const ctx = canvas.getContext('2d')
       if (ctx) {
         // Gradient color background
-        const grad = ctx.createLinearGradient(0, 0, 400, 300)
+        const grad = ctx.createLinearGradient(0, 0, canvasWidth, canvasHeight)
         grad.addColorStop(0, '#1e293b')
         grad.addColorStop(1, '#0f172a')
         ctx.fillStyle = grad
-        ctx.fillRect(0, 0, 400, 300)
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight)
         
         // Custom graphic decoration
         ctx.strokeStyle = '#38bdf8'
         ctx.lineWidth = 4
-        ctx.strokeRect(20, 20, 360, 260)
+        ctx.strokeRect(20, 20, canvasWidth - 40, canvasHeight - 40)
         
         ctx.fillStyle = '#f8fafc'
-        ctx.font = 'bold 20px monospace'
+        ctx.font = `bold ${Math.max(16, Math.round(canvasWidth / 30))}px monospace`
         ctx.fillText('VISUAL DATA PIPELINE', 40, 70)
-        ctx.font = '14px monospace'
+        ctx.font = `${Math.max(10, Math.round(canvasWidth / 50))}px monospace`
         ctx.fillStyle = '#94a3b8'
         ctx.fillText(`Session: ${sessionId.slice(0, 8)}...`, 40, 110)
         ctx.fillText(`Frame: #${simulatedCount.toString().padStart(4, '0')}`, 40, 140)
@@ -323,7 +394,7 @@ function App() {
         // A red scanning light
         ctx.fillStyle = '#ef4444'
         ctx.beginPath()
-        ctx.arc(340, 70, 8 + Math.sin(simulatedCount) * 4, 0, 2 * Math.PI)
+        ctx.arc(canvasWidth - 60, 70, 8 + Math.sin(simulatedCount) * 4, 0, 2 * Math.PI)
         ctx.fill()
       }
       
@@ -335,7 +406,8 @@ function App() {
           sessionId: sessionId,
           timestamp: timestamp,
           url: url,
-          image: base64Image
+          image: base64Image,
+          sequence: simulatedCount
         }))
       }
 
@@ -488,9 +560,9 @@ function App() {
       <main className="flex-1 flex flex-col overflow-hidden bg-slate-950">
         
         {/* Top Control Header */}
-        <header className="p-4 border-b border-slate-800 bg-slate-900/30 flex items-center justify-between space-x-4">
-          <div className="flex-1 max-w-xl flex items-center space-x-2">
-            <div className="relative flex-1">
+        <header className="p-4 border-b border-slate-800 bg-slate-900/30 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex-1 max-w-4xl flex flex-wrap items-center gap-3">
+            <div className="relative flex-1 min-w-[240px]">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                 <Globe className="w-4 h-4" />
               </div>
@@ -504,6 +576,56 @@ function App() {
               />
             </div>
             
+            {/* Viewport Resolution Selector */}
+            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
+              <span className="text-slate-400 font-mono">Pantalla:</span>
+              <select
+                value={viewportResolution}
+                onChange={(e) => setViewportResolution(e.target.value)}
+                disabled={isCapturing}
+                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
+              >
+                <option value="responsive" className="bg-slate-950 text-slate-300">Adaptativo (Full width)</option>
+                <option value="1280x800" className="bg-slate-950 text-slate-300">Desktop Estándar (1280x800)</option>
+                <option value="1920x1080" className="bg-slate-950 text-slate-300">Desktop Full HD (1920x1080)</option>
+                <option value="1280x720" className="bg-slate-950 text-slate-300">Desktop HD (1280x720)</option>
+                <option value="1024x768" className="bg-slate-950 text-slate-300">Tablet (1024x768)</option>
+                <option value="375x812" className="bg-slate-950 text-slate-300">Mobile (375x812)</option>
+              </select>
+            </div>
+
+            {/* Scale Selector */}
+            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
+              <span className="text-slate-400 font-mono">Escala:</span>
+              <select
+                value={scale}
+                onChange={(e) => setScale(Number(e.target.value))}
+                disabled={isCapturing}
+                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
+              >
+                <option value="0.25" className="bg-slate-950 text-slate-300">25% (Eco)</option>
+                <option value="0.5" className="bg-slate-950 text-slate-300">50% (Normal)</option>
+                <option value="0.75" className="bg-slate-950 text-slate-300">75%</option>
+                <option value="1.0" className="bg-slate-950 text-slate-300">100% (FHD)</option>
+              </select>
+            </div>
+
+            {/* Quality Selector */}
+            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
+              <span className="text-slate-400 font-mono">Calidad:</span>
+              <select
+                value={quality}
+                onChange={(e) => setQuality(Number(e.target.value))}
+                disabled={isCapturing}
+                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
+              >
+                <option value="50" className="bg-slate-950 text-slate-300">50%</option>
+                <option value="65" className="bg-slate-950 text-slate-300">65%</option>
+                <option value="75" className="bg-slate-950 text-slate-300">75% (Recom.)</option>
+                <option value="85" className="bg-slate-950 text-slate-300">85%</option>
+              </select>
+            </div>
+
             {isCapturing ? (
               <button
                 onClick={stopCapture}
@@ -551,17 +673,22 @@ function App() {
                   <span className="h-2 w-2 rounded-full bg-green-500"></span>
                   <span className="font-mono truncate max-w-[400px]">{captureUrl || inputUrl}</span>
                 </div>
-                <div className="flex items-center space-x-1 bg-cyan-950/30 border border-cyan-800/30 px-2.5 py-0.5 rounded-full text-cyan-400 font-mono">
-                  <span>Capturando pantalla...</span>
+                <div className="flex items-center space-x-2">
+                  <div className="flex items-center space-x-1 bg-cyan-950/30 border border-cyan-800/30 px-2.5 py-0.5 rounded-full text-cyan-400 font-mono text-[10px]">
+                    <span>Pantalla: {viewportResolution === 'responsive' ? 'Adaptativo' : viewportResolution}</span>
+                  </div>
+                  <div className="flex items-center space-x-1 bg-cyan-950/30 border border-cyan-800/30 px-2.5 py-0.5 rounded-full text-cyan-400 font-mono text-[10px]">
+                    <span>Capturando...</span>
+                  </div>
                 </div>
               </div>
-              <div className="flex-1 bg-white relative">
+              <div ref={containerRef} className="flex-1 bg-slate-950 relative overflow-hidden">
                 {isElectron ? (
                   // Electron Real Webview Element
                   <webview
                     id="embedded-browser"
                     src={inputUrl}
-                    style={{ width: '100%', height: '100%', border: 'none' }}
+                    style={webviewStyle}
                   ></webview>
                 ) : (
                   // Simulated webview in standard browser

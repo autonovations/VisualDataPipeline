@@ -172,10 +172,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 image_bytes = base64.b64decode(image_data)
                 
-                # Determine next screenshot index based on database count
-                count = await db.screenshots.count_documents({"sessionId": session_id})
-                next_index = count + 1
-                filename = f"{next_index:06d}.jpg"
+                # Determine screenshot filename based on sequence index
+                sequence = data.get("sequence")
+                if sequence is not None:
+                    next_index = int(sequence)
+                    filename = f"{next_index:06d}.jpg"
+                else:
+                    # Fallback to counting documents if not provided (backward compatibility)
+                    count = await db.screenshots.count_documents({"sessionId": session_id})
+                    next_index = count + 1
+                    filename = f"{next_index:06d}.jpg"
                 
                 # Path relative to storage folder for DB reference
                 relative_path = f"{session_id}/{filename}"

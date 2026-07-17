@@ -39,9 +39,24 @@ function stopCaptureLoop() {
 }
 
 // IPC Handlers
-ipcMain.on('start-capture', (event, sessionId) => {
+ipcMain.on('start-capture', (event, config) => {
   stopCaptureLoop(); // Clear any existing loop first
-  console.log(`Starting capture loop for session: ${sessionId}`);
+
+  let sessionId;
+  let scale = 0.5;
+  let quality = 70;
+
+  if (typeof config === 'string') {
+    sessionId = config;
+  } else {
+    sessionId = config.sessionId;
+    scale = config.scale ?? scale;
+    quality = config.quality ?? quality;
+  }
+
+  console.log(`Starting capture loop for session: ${sessionId} (Scale: ${scale}, Quality: ${quality})`);
+
+  let frameSequence = 0;
 
   // Wait a short moment to ensure the webview WebContents is initialized
   setTimeout(() => {
@@ -70,8 +85,8 @@ ipcMain.on('start-capture', (event, sessionId) => {
     webviewWebContents.on('did-navigate', sendNavigationUpdate);
     webviewWebContents.on('did-navigate-in-page', sendNavigationUpdate);
 
-    // Track the last captured bitmap and URL to avoid capturing duplicate content
-    let lastBitmapBuffer = null;
+    // Track the last captured thumbnail buffer and URL to avoid capturing duplicate content
+    let lastThumbnailBuffer = null;
     let lastUrl = null;
 
     // Capture every 333ms (3 FPS)
@@ -85,21 +100,35 @@ ipcMain.on('start-capture', (event, sessionId) => {
         const currentUrl = webviewWebContents.getURL();
         const image = await webviewWebContents.capturePage();
         
-        // Use raw bitmap comparison to check if the page content has changed
-        const currentBitmap = image.toBitmap();
-        const isChanged = !lastBitmapBuffer || lastUrl !== currentUrl || !lastBitmapBuffer.equals(currentBitmap);
+        // Visual Change Detection: resize image to 16x16 pixels to filter out cursor blinks/minor animations
+        const thumbnail = image.resize({ width: 16, height: 16, quality: 'good' });
+        const currentThumbnailBuffer = thumbnail.toBitmap();
+        const isChanged = !lastThumbnailBuffer || lastUrl !== currentUrl || !lastThumbnailBuffer.equals(currentThumbnailBuffer);
 
         if (isChanged) {
-          lastBitmapBuffer = currentBitmap;
+          lastThumbnailBuffer = currentThumbnailBuffer;
           lastUrl = currentUrl;
+          frameSequence++;
 
-          const base64Image = image.toJPEG(85).toString('base64');
+          // Apply scale adjustment if not 100%
+          let processedImage = image;
+          if (scale !== 1.0) {
+            const size = image.getSize();
+            processedImage = image.resize({
+              width: Math.round(size.width * scale),
+              height: Math.round(size.height * scale),
+              quality: 'better'
+            });
+          }
+
+          const base64Image = processedImage.toJPEG(quality).toString('base64');
 
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('screenshot-captured', {
               image: base64Image,
               url: currentUrl,
-              timestamp: new Date().toISOString()
+              timestamp: new Date().toISOString(),
+              sequence: frameSequence
             });
           }
         }
