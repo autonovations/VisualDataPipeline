@@ -70,6 +70,10 @@ ipcMain.on('start-capture', (event, sessionId) => {
     webviewWebContents.on('did-navigate', sendNavigationUpdate);
     webviewWebContents.on('did-navigate-in-page', sendNavigationUpdate);
 
+    // Track the last captured bitmap and URL to avoid capturing duplicate content
+    let lastBitmapBuffer = null;
+    let lastUrl = null;
+
     // Capture every 333ms (3 FPS)
     captureInterval = setInterval(async () => {
       try {
@@ -78,16 +82,26 @@ ipcMain.on('start-capture', (event, sessionId) => {
           return;
         }
 
-        const image = await webviewWebContents.capturePage();
-        const base64Image = image.toJPEG(85).toString('base64');
         const currentUrl = webviewWebContents.getURL();
+        const image = await webviewWebContents.capturePage();
+        
+        // Use raw bitmap comparison to check if the page content has changed
+        const currentBitmap = image.toBitmap();
+        const isChanged = !lastBitmapBuffer || lastUrl !== currentUrl || !lastBitmapBuffer.equals(currentBitmap);
 
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('screenshot-captured', {
-            image: base64Image,
-            url: currentUrl,
-            timestamp: new Date().toISOString()
-          });
+        if (isChanged) {
+          lastBitmapBuffer = currentBitmap;
+          lastUrl = currentUrl;
+
+          const base64Image = image.toJPEG(85).toString('base64');
+
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('screenshot-captured', {
+              image: base64Image,
+              url: currentUrl,
+              timestamp: new Date().toISOString()
+            });
+          }
         }
       } catch (err) {
         console.error("Error capturing page:", err);
