@@ -1,280 +1,166 @@
 import { useState, useEffect, useRef } from 'react'
-import { 
-  Play, 
-  Square, 
-  Wifi, 
-  WifiOff, 
-  Image as ImageIcon, 
-  History, 
-  ExternalLink,
-  Laptop,
-  AlertTriangle,
-  Globe,
-  Loader2,
-  Clock,
-  Camera
-} from 'lucide-react'
-
-// Extend window interface for Electron IPC Bridge
-declare global {
-  interface Window {
-    electronAPI?: {
-      startCapture: (config: { sessionId: string; scale: number; quality: number } | string) => void;
-      stopCapture: () => void;
-      onScreenshot: (callback: (event: any, data: { image: string; url: string; timestamp: string; sequence?: number }) => void) => () => void;
-      onWebviewNavigate: (callback: (event: any, url: string) => void) => () => void;
-    };
-  }
-}
-
-interface Session {
-  id: string
-  createdAt: string
-  startUrl: string
-}
-
-interface Screenshot {
-  id: string
-  sessionId: string
-  timestamp: string
-  url: string
-  imagePath: string
-}
+import Sidebar from './components/Sidebar'
+import Header from './components/Header'
+import Viewport from './components/Viewport'
+import Gallery from './components/Gallery'
+import { useWebSocket } from './hooks/useWebSocket'
+import { useElectron } from './hooks/useElectron'
+import { useSessions } from './hooks/useSessions'
+import { DESKTOP_RESOLUTIONS } from './types'
+import type { Session, LiveScreenshot, CaptureStats } from './types'
 
 function App() {
   // Input URL
   const [inputUrl, setInputUrl] = useState('https://news.ycombinator.com')
-  
-  // App states
-  const [sessions, setSessions] = useState<Session[]>([])
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
-  const [selectedSessionScreenshots, setSelectedSessionScreenshots] = useState<Screenshot[]>([])
-  
+
   // Active session states
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [isCapturing, setIsCapturing] = useState(false)
   const [captureUrl, setCaptureUrl] = useState('')
   const [capturedCount, setCapturedCount] = useState(0)
-  const [liveGallery, setLiveGallery] = useState<{ id: string; url: string; timestamp: string; imagePath: string }[]>([])
-  
-  // Connections
-  const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected')
-  const wsRef = useRef<WebSocket | null>(null)
-  const [isElectron, setIsElectron] = useState(false)
-  
-  // Custom pipeline config states
-  const [scale, setScale] = useState(0.5)
-  const [quality, setQuality] = useState(75)
-  const [viewportResolution, setViewportResolution] = useState('responsive')
-  
-  // Viewport container size tracker
-  const containerRef = useRef<HTMLDivElement>(null)
-  const [containerSize, setContainerSize] = useState({ width: 800, height: 350 })
+  const [liveGallery, setLiveGallery] = useState<LiveScreenshot[]>([])
 
-  // ResizeObserver to track container height/width
-  useEffect(() => {
-    if (!containerRef.current) return
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        setContainerSize({
-          width: entry.contentRect.width,
-          height: entry.contentRect.height,
-        })
-      }
-    })
-    observer.observe(containerRef.current)
-    return () => {
-      observer.disconnect()
-    }
-  }, [isCapturing])
+  // Pipeline config (desktop-only resolutions)
+  const [resolution, setResolution] = useState('1920x1080')
+  const [scale, setScale] = useState(1.0)
+  const [quality, setQuality] = useState(85)
 
-  // Get active webview dimensions
-  const getViewportDimensions = () => {
-    switch (viewportResolution) {
-      case '1280x800': return { width: 1280, height: 800 }
-      case '1920x1080': return { width: 1920, height: 1080 }
-      case '1280x720': return { width: 1280, height: 720 }
-      case '1024x768': return { width: 1024, height: 768 }
-      case '375x812': return { width: 375, height: 812 }
-      default: return null
-    }
-  }
+  // Capture stats from Electron main process
+  const [captureStats, setCaptureStats] = useState<CaptureStats | null>(null)
 
-  const dims = getViewportDimensions()
-  const scaleX = dims ? containerSize.width / dims.width : 1
-  const scaleY = dims ? containerSize.height / dims.height : 1
-  const scaleFactor = dims ? Math.min(scaleX, scaleY, 1) : 1
-
-  const webviewStyle = dims ? {
-    width: `${dims.width}px`,
-    height: `${dims.height}px`,
-    transform: `scale(${scaleFactor})`,
-    transformOrigin: 'top left',
-    position: 'absolute' as const,
-    left: `${Math.max(0, (containerSize.width - dims.width * scaleFactor) / 2)}px`,
-    top: `${Math.max(0, (containerSize.height - dims.height * scaleFactor) / 2)}px`,
-    border: 'none',
-    boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
-    borderRadius: '4px',
-    overflow: 'hidden'
-  } : {
-    width: '100%',
-    height: '100%',
-    border: 'none',
-  }
-  
-  // Mock simulation for browser preview
+  // Mock simulation ref for browser preview
   const mockIntervalRef = useRef<number | null>(null)
 
-  // API Config
-  const API_BASE_URL = 'http://localhost:8000'
-  const WS_URL = 'ws://localhost:8000/ws'
+  // Custom hooks
+  const { wsStatus, wsRef, sendJson, connect: connectWs } = useWebSocket()
+  const { isElectron, electronAPI } = useElectron()
+  const {
+    sessions,
+    selectedSessionId,
+    setSelectedSessionId,
+    selectedSessionScreenshots,
+    fetchSessions,
+    createSession,
+    deleteSession,
+    fetchScreenshots,
+    selectSession,
+  } = useSessions()
 
-  // Detect environment
-  useEffect(() => {
-    if (window.electronAPI) {
-      setIsElectron(true)
-    }
-  }, [])
-
-  // Initialize: load sessions & connect WS
+  // Initialize: load sessions
   useEffect(() => {
     fetchSessions()
-    connectWebSocket()
     return () => {
-      if (wsRef.current) wsRef.current.close()
       if (mockIntervalRef.current) clearInterval(mockIntervalRef.current)
     }
-  }, [])
+  }, [fetchSessions])
 
-  // Connect to WebSocket
-  const connectWebSocket = () => {
-    setWsStatus('connecting')
-    
-    try {
-      const ws = new WebSocket(WS_URL)
-      wsRef.current = ws
-
-      ws.onopen = () => {
-        setWsStatus('connected')
-        console.log('WebSocket connected')
-      }
-
-      ws.onmessage = (event) => {
-        try {
-          const response = JSON.parse(event.data)
-          if (response.status === 'ok') {
-            // Acknowledge receipt
-            setCapturedCount(response.count)
-          } else {
-            console.error('WS response error:', response.message)
-          }
-        } catch (err) {
-          console.error('Error parsing WS message:', err)
-        }
-      }
-
-      ws.onclose = () => {
-        setWsStatus('disconnected')
-        console.log('WebSocket disconnected')
-        // Auto-reconnect after 3 seconds if not capturing
-        setTimeout(() => {
-          if (!isCapturing && wsRef.current?.readyState === WebSocket.CLOSED) {
-            connectWebSocket()
-          }
-        }, 3000)
-      }
-
-      ws.onerror = (err) => {
-        console.error('WebSocket error:', err)
-        setWsStatus('disconnected')
-      }
-    } catch (e) {
-      console.error('Failed to create WebSocket:', e)
-      setWsStatus('disconnected')
-    }
-  }
-
-  // Load all sessions
-  const fetchSessions = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/sessions`)
-      if (response.ok) {
-        const data = await response.json()
-        setSessions(data)
-      }
-    } catch (err) {
-      console.error('Error fetching sessions:', err)
-    }
-  }
-
-  // Load screenshots for a specific session
-  const fetchScreenshots = async (sessionId: string) => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/screenshots/${sessionId}`)
-      if (response.ok) {
-        const data = await response.json()
-        setSelectedSessionScreenshots(data)
-      }
-    } catch (err) {
-      console.error('Error fetching screenshots:', err)
-    }
-  }
-
-  // Handle clicking on a historical session
-  const handleSelectSession = (sessionId: string) => {
-    setSelectedSessionId(sessionId)
-    fetchScreenshots(sessionId)
-  }
-
-  // Webview navigation event listener (Electron only)
+  // WS message handler — update capturedCount from backend ACK
   useEffect(() => {
-    if (!isElectron || !window.electronAPI) return
+    const ws = wsRef.current
+    if (!ws) return
 
-    const unsubscribe = window.electronAPI.onWebviewNavigate((_event, url) => {
+    const handler = (event: MessageEvent) => {
+      try {
+        const response = JSON.parse(event.data)
+        if (response.status === 'ok') {
+          setCapturedCount(response.count)
+        } else if (response.status === 'error') {
+          console.error('[WS] Backend error:', response.message)
+        }
+      } catch (err) {
+        console.error('[WS] Error parsing message:', err)
+      }
+    }
+
+    ws.addEventListener('message', handler)
+    return () => {
+      ws.removeEventListener('message', handler)
+    }
+  }, [wsRef.current])
+
+  // Webview navigation listener (Electron only)
+  useEffect(() => {
+    if (!isElectron || !electronAPI) return
+
+    const unsubscribe = electronAPI.onWebviewNavigate((_event: unknown, url: string) => {
       setCaptureUrl(url)
     })
 
-    return () => {
-      unsubscribe()
-    }
-  }, [isElectron])
+    return () => { unsubscribe() }
+  }, [isElectron, electronAPI])
 
-  // Capture event listener (Electron only)
+  // Capture stats listener (Electron only)
   useEffect(() => {
-    if (!isElectron || !window.electronAPI || !isCapturing || !activeSession) return
+    if (!isElectron || !electronAPI) return
 
-    const unsubscribe = window.electronAPI.onScreenshot((_event, data) => {
-      // 1. Send immediately to backend over WebSocket
+    const unsubscribe = electronAPI.onCaptureStats((_event: unknown, stats: CaptureStats) => {
+      setCaptureStats(stats)
+    })
+
+    return () => { unsubscribe() }
+  }, [isElectron, electronAPI])
+
+  // Screenshot stream listener (Electron only)
+  useEffect(() => {
+    if (!isElectron || !electronAPI || !isCapturing || !activeSession) return
+
+    const unsubscribe = electronAPI.onScreenshot((_event: unknown, data) => {
+      // Convert binary buffer to base64 for display + WS transmission
+      let base64Image: string
+
+      if (data.imageBuffer) {
+        // New binary mode: convert ArrayBuffer/Buffer to base64
+        const bytes = new Uint8Array(data.imageBuffer as ArrayBuffer)
+        let binary = ''
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i])
+        }
+        base64Image = btoa(binary)
+      } else if (data.image) {
+        // Legacy base64 mode
+        base64Image = data.image
+      } else {
+        return
+      }
+
+      // Send to backend over WebSocket (base64 for now, binary upgrade later)
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({
+        sendJson({
           sessionId: activeSession.id,
           timestamp: data.timestamp,
           url: data.url,
-          image: data.image, // already base64 encoded
-          sequence: data.sequence
-        }))
+          image: base64Image,
+          sequence: data.sequence,
+          capture: data.capture,
+        })
       }
 
-      // 2. Prepend to live gallery preview
-      const liveItem = {
+      // Prepend to live gallery preview
+      const liveItem: LiveScreenshot = {
         id: Math.random().toString(),
         url: data.url,
         timestamp: data.timestamp,
-        imagePath: `data:image/jpeg;base64,${data.image}`
+        imagePath: `data:image/jpeg;base64,${base64Image}`,
+        fileSizeBytes: data.capture?.fileSizeBytes,
       }
       setLiveGallery(prev => [liveItem, ...prev.slice(0, 11)]) // Keep last 12 in UI
     })
 
-    return () => {
-      unsubscribe()
-    }
-  }, [isElectron, isCapturing, activeSession])
+    return () => { unsubscribe() }
+  }, [isElectron, electronAPI, isCapturing, activeSession, sendJson, wsRef])
 
-  // Start Capturing Session
+  // ───────────────────────────────────────────────────────────
+  // Actions
+  // ───────────────────────────────────────────────────────────
+
+  const getResolutionDimensions = () => {
+    const res = DESKTOP_RESOLUTIONS.find(r => r.value === resolution)
+    return res ? { width: res.width, height: res.height } : { width: 1920, height: 1080 }
+  }
+
   const startSession = async () => {
     if (!inputUrl) return
-    
+
     // Ensure URL has protocol
     let targetUrl = inputUrl
     if (!/^https?:\/\//i.test(targetUrl)) {
@@ -285,141 +171,139 @@ function App() {
 
     // Ensure WS is connected
     if (wsRef.current?.readyState !== WebSocket.OPEN) {
-      connectWebSocket()
+      connectWs()
     }
 
-    try {
-      // 1. Create session in backend
-      const response = await fetch(`${API_BASE_URL}/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ startUrl: targetUrl })
+    // Create session in backend
+    const session = await createSession(targetUrl)
+    if (!session) {
+      alert('Error: No se pudo crear la sesión en el backend.')
+      return
+    }
+
+    // Update UI states
+    setActiveSession(session)
+    setIsCapturing(true)
+    setCapturedCount(0)
+    setLiveGallery([])
+    setCaptureStats(null)
+    setSelectedSessionId(session.id)
+
+    // Start capture
+    if (isElectron && electronAPI) {
+      // Electron: start capture in hidden window at desktop resolution
+      electronAPI.startCapture({
+        sessionId: session.id,
+        url: targetUrl,
+        scale: scale,
+        quality: quality,
+        resolution: getResolutionDimensions(),
       })
-
-      if (!response.ok) {
-        throw new Error('Failed to create session in backend')
-      }
-
-      const session: Session = await response.json()
-      
-      // Update UI states
-      setActiveSession(session)
-      setIsCapturing(true)
-      setCapturedCount(0)
-      setLiveGallery([])
-      setSelectedSessionId(session.id)
-      setSelectedSessionScreenshots([])
-
-      // 2. Start Capture trigger
-      if (isElectron && window.electronAPI) {
-        // Trigger Electron capture loop of the webview with configs
-        window.electronAPI.startCapture({
-          sessionId: session.id,
-          scale: scale,
-          quality: quality
-        })
-      } else {
-        // Fallback: Web browser simulation mode
-        startMockSimulation(session.id, targetUrl)
-      }
-
-      // Reload sessions list
-      fetchSessions()
-
-    } catch (err) {
-      alert(`Error starting session: ${err instanceof Error ? err.message : String(err)}`)
+    } else {
+      // Fallback: web browser simulation
+      startMockSimulation(session.id, targetUrl)
     }
+
+    fetchSessions()
   }
 
-  // Stop Capture
   const stopCapture = () => {
-    if (isElectron && window.electronAPI) {
-      window.electronAPI.stopCapture()
+    if (isElectron && electronAPI) {
+      electronAPI.stopCapture()
     } else {
       stopMockSimulation()
     }
 
     setIsCapturing(false)
     setActiveSession(null)
+    setCaptureStats(null)
     fetchSessions()
-    
-    // Reload screenshots for final view
+
     if (selectedSessionId) {
       fetchScreenshots(selectedSessionId)
     }
   }
 
-  // Web Browser Mock Capture Simulation
+  // ───────────────────────────────────────────────────────────
+  // Mock Simulation (Web Browser Fallback)
+  // ───────────────────────────────────────────────────────────
+
   const startMockSimulation = (sessionId: string, url: string) => {
     if (mockIntervalRef.current) clearInterval(mockIntervalRef.current)
-    
-    // Get target dimensions for simulated canvas
-    const currentDims = getViewportDimensions()
-    const canvasWidth = currentDims ? currentDims.width : 1280
-    const canvasHeight = currentDims ? currentDims.height : 800
 
+    const dims = getResolutionDimensions()
     let simulatedCount = 0
+
     mockIntervalRef.current = window.setInterval(() => {
       simulatedCount++
       const timestamp = new Date().toISOString()
-      
-      // Generate a mock color canvas block base64 image representing a captured screenshot
+
+      // Generate mock canvas screenshot
       const canvas = document.createElement('canvas')
-      canvas.width = canvasWidth
-      canvas.height = canvasHeight
+      canvas.width = dims.width
+      canvas.height = dims.height
       const ctx = canvas.getContext('2d')
       if (ctx) {
-        // Gradient color background
-        const grad = ctx.createLinearGradient(0, 0, canvasWidth, canvasHeight)
+        // Gradient background
+        const grad = ctx.createLinearGradient(0, 0, dims.width, dims.height)
         grad.addColorStop(0, '#1e293b')
         grad.addColorStop(1, '#0f172a')
         ctx.fillStyle = grad
-        ctx.fillRect(0, 0, canvasWidth, canvasHeight)
-        
-        // Custom graphic decoration
+        ctx.fillRect(0, 0, dims.width, dims.height)
+
+        // Border decoration
         ctx.strokeStyle = '#38bdf8'
         ctx.lineWidth = 4
-        ctx.strokeRect(20, 20, canvasWidth - 40, canvasHeight - 40)
-        
+        ctx.strokeRect(20, 20, dims.width - 40, dims.height - 40)
+
+        // Text info
         ctx.fillStyle = '#f8fafc'
-        ctx.font = `bold ${Math.max(16, Math.round(canvasWidth / 30))}px monospace`
+        ctx.font = `bold ${Math.max(16, Math.round(dims.width / 30))}px monospace`
         ctx.fillText('VISUAL DATA PIPELINE', 40, 70)
-        ctx.font = `${Math.max(10, Math.round(canvasWidth / 50))}px monospace`
+
+        ctx.font = `${Math.max(10, Math.round(dims.width / 50))}px monospace`
         ctx.fillStyle = '#94a3b8'
-        ctx.fillText(`Session: ${sessionId.slice(0, 8)}...`, 40, 110)
-        ctx.fillText(`Frame: #${simulatedCount.toString().padStart(4, '0')}`, 40, 140)
-        ctx.fillText(`URL: ${url}`, 40, 170)
-        ctx.fillText(`Time: ${new Date(timestamp).toLocaleTimeString()}`, 40, 200)
-        
-        // A red scanning light
+        ctx.fillText(`Resolución: ${dims.width}×${dims.height} (Desktop)`, 40, 110)
+        ctx.fillText(`Session: ${sessionId.slice(0, 8)}...`, 40, 145)
+        ctx.fillText(`Frame: #${simulatedCount.toString().padStart(4, '0')}`, 40, 180)
+        ctx.fillText(`URL: ${url}`, 40, 215)
+        ctx.fillText(`Time: ${new Date(timestamp).toLocaleTimeString()}`, 40, 250)
+
+        // Recording indicator
         ctx.fillStyle = '#ef4444'
         ctx.beginPath()
-        ctx.arc(canvasWidth - 60, 70, 8 + Math.sin(simulatedCount) * 4, 0, 2 * Math.PI)
+        ctx.arc(dims.width - 60, 70, 8 + Math.sin(simulatedCount) * 4, 0, 2 * Math.PI)
         ctx.fill()
       }
-      
+
       const base64Image = canvas.toDataURL('image/jpeg', 0.8)
-      
+
       // Send over WS
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({
+        sendJson({
           sessionId: sessionId,
           timestamp: timestamp,
           url: url,
           image: base64Image,
-          sequence: simulatedCount
-        }))
+          sequence: simulatedCount,
+          capture: {
+            resolution: dims,
+            scale: scale,
+            quality: quality,
+            outputSize: dims,
+          },
+        })
       }
 
-      // Add to live view
-      const liveItem = {
+      // Add to live gallery
+      const liveItem: LiveScreenshot = {
         id: Math.random().toString(),
         url: url,
         timestamp: timestamp,
-        imagePath: base64Image
+        imagePath: base64Image,
       }
       setLiveGallery(prev => [liveItem, ...prev.slice(0, 11)])
-    }, 333) // 3 frames per second (every 333ms)
+    }, 333) // 3 FPS
   }
 
   const stopMockSimulation = () => {
@@ -429,396 +313,58 @@ function App() {
     }
   }
 
-  // Format date readable
-  const formatDate = (isoStr: string) => {
-    try {
-      const date = new Date(isoStr)
-      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    } catch {
-      return isoStr
-    }
-  }
+  // ───────────────────────────────────────────────────────────
+  // Render
+  // ───────────────────────────────────────────────────────────
 
   return (
     <div className="flex h-screen overflow-hidden bg-slate-950 text-slate-100">
-      
-      {/* Sidebar: Historical Sessions List */}
-      <aside className="w-80 border-r border-slate-800 bg-slate-900/60 backdrop-blur-xl flex flex-col">
-        <div className="p-5 border-b border-slate-800 flex items-center space-x-3 bg-gradient-to-r from-cyan-950/20 to-slate-900">
-          <div className="p-2 bg-cyan-500/10 rounded-lg text-cyan-400 border border-cyan-500/20 shadow-glow">
-            <Camera className="w-6 h-6" />
-          </div>
-          <div>
-            <h1 className="text-lg font-bold tracking-tight text-white">Visual Data</h1>
-            <p className="text-xs text-slate-400 font-mono">Pipeline MVP v0.1</p>
-          </div>
-        </div>
+      <Sidebar
+        sessions={sessions}
+        selectedSessionId={selectedSessionId}
+        activeSessionId={activeSession?.id ?? null}
+        isCapturing={isCapturing}
+        wsStatus={wsStatus}
+        isElectron={isElectron}
+        onSelectSession={selectSession}
+        onDeleteSession={deleteSession}
+      />
 
-        {/* Sessions list */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          <div className="flex items-center space-x-2 text-slate-400 text-xs font-semibold tracking-wider uppercase mb-2">
-            <History className="w-4 h-4" />
-            <span>Historial de Sesiones</span>
-          </div>
-
-          {sessions.length === 0 ? (
-            <div className="p-6 text-center border border-dashed border-slate-800 rounded-xl bg-slate-950/40">
-              <p className="text-sm text-slate-500">No hay sesiones creadas</p>
-            </div>
-          ) : (
-            sessions.map((session) => {
-              const isSelected = selectedSessionId === session.id
-              const isActive = activeSession?.id === session.id
-              return (
-                <button
-                  key={session.id}
-                  onClick={() => handleSelectSession(session.id)}
-                  disabled={isCapturing && !isActive}
-                  className={`w-full text-left p-3.5 rounded-xl border transition-all duration-300 ${
-                    isSelected 
-                      ? 'bg-cyan-500/10 border-cyan-500/40 text-white shadow-[0_0_15px_rgba(6,182,212,0.1)]' 
-                      : 'bg-slate-950/40 border-slate-800/80 hover:bg-slate-800/50 text-slate-300 hover:text-white'
-                  } ${isCapturing && !isActive ? 'opacity-40 cursor-not-allowed' : ''}`}
-                >
-                  <div className="flex items-start justify-between">
-                    <span className="font-mono text-xs text-slate-500 truncate max-w-[120px]">
-                      ID: {session.id.slice(0, 8)}...
-                    </span>
-                    {isActive && (
-                      <span className="flex h-2 w-2 relative">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
-                      </span>
-                    )}
-                  </div>
-                  <div className="mt-1.5 font-medium truncate text-sm">
-                    {session.startUrl}
-                  </div>
-                  <div className="mt-2 flex items-center text-[11px] text-slate-500 space-x-1">
-                    <Clock className="w-3.5 h-3.5" />
-                    <span>{formatDate(session.createdAt)}</span>
-                  </div>
-                </button>
-              )
-            })
-          )}
-        </div>
-
-        {/* Footer: Environment & WebSocket status */}
-        <div className="p-4 border-t border-slate-800 bg-slate-950/80 space-y-2">
-          {/* WebSocket Status */}
-          <div className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-900 border border-slate-800">
-            <span className="text-slate-400">WebSocket:</span>
-            <div className="flex items-center space-x-1.5">
-              {wsStatus === 'connected' ? (
-                <>
-                  <Wifi className="w-4 h-4 text-emerald-400 animate-pulse" />
-                  <span className="text-emerald-400 font-semibold">Conectado</span>
-                </>
-              ) : wsStatus === 'connecting' ? (
-                <>
-                  <Loader2 className="w-4 h-4 text-amber-400 animate-spin" />
-                  <span className="text-amber-400 font-semibold">Conectando</span>
-                </>
-              ) : (
-                <>
-                  <WifiOff className="w-4 h-4 text-rose-500" />
-                  <span className="text-rose-500 font-semibold">Desconectado</span>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* App Execution Environment */}
-          <div className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-900 border border-slate-800">
-            <span className="text-slate-400">Entorno:</span>
-            <div className="flex items-center space-x-1">
-              {isElectron ? (
-                <>
-                  <Laptop className="w-4 h-4 text-cyan-400" />
-                  <span className="text-cyan-400 font-semibold">Desktop (Electron)</span>
-                </>
-              ) : (
-                <>
-                  <Globe className="w-4 h-4 text-indigo-400" />
-                  <span className="text-indigo-400 font-semibold">Web (Simulado)</span>
-                </>
-              )}
-            </div>
-          </div>
-
-          {!isElectron && (
-            <div className="flex items-start space-x-1.5 text-[10px] text-amber-400/90 bg-amber-500/5 p-2 rounded-lg border border-amber-500/10">
-              <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-              <span>Para capturar sitios reales usa la app Desktop.</span>
-            </div>
-          )}
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
       <main className="flex-1 flex flex-col overflow-hidden bg-slate-950">
-        
-        {/* Top Control Header */}
-        <header className="p-4 border-b border-slate-800 bg-slate-900/30 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-          <div className="flex-1 max-w-4xl flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 min-w-[240px]">
-              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
-                <Globe className="w-4 h-4" />
-              </div>
-              <input
-                type="text"
-                placeholder="Escribe la URL a capturar (ej: https://news.ycombinator.com)..."
-                value={inputUrl}
-                onChange={(e) => setInputUrl(e.target.value)}
-                disabled={isCapturing}
-                className="w-full pl-9 pr-4 py-2 bg-slate-900 border border-slate-800 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 rounded-xl text-slate-100 placeholder-slate-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed text-sm transition-all"
-              />
-            </div>
-            
-            {/* Viewport Resolution Selector */}
-            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
-              <span className="text-slate-400 font-mono">Pantalla:</span>
-              <select
-                value={viewportResolution}
-                onChange={(e) => setViewportResolution(e.target.value)}
-                disabled={isCapturing}
-                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
-              >
-                <option value="responsive" className="bg-slate-950 text-slate-300">Adaptativo (Full width)</option>
-                <option value="1280x800" className="bg-slate-950 text-slate-300">Desktop Estándar (1280x800)</option>
-                <option value="1920x1080" className="bg-slate-950 text-slate-300">Desktop Full HD (1920x1080)</option>
-                <option value="1280x720" className="bg-slate-950 text-slate-300">Desktop HD (1280x720)</option>
-                <option value="1024x768" className="bg-slate-950 text-slate-300">Tablet (1024x768)</option>
-                <option value="375x812" className="bg-slate-950 text-slate-300">Mobile (375x812)</option>
-              </select>
-            </div>
+        <Header
+          inputUrl={inputUrl}
+          onUrlChange={setInputUrl}
+          isCapturing={isCapturing}
+          capturedCount={capturedCount}
+          resolution={resolution}
+          onResolutionChange={setResolution}
+          scale={scale}
+          onScaleChange={setScale}
+          quality={quality}
+          onQualityChange={setQuality}
+          onStartCapture={startSession}
+          onStopCapture={stopCapture}
+          captureStats={captureStats}
+        />
 
-            {/* Scale Selector */}
-            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
-              <span className="text-slate-400 font-mono">Escala:</span>
-              <select
-                value={scale}
-                onChange={(e) => setScale(Number(e.target.value))}
-                disabled={isCapturing}
-                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
-              >
-                <option value="0.25" className="bg-slate-950 text-slate-300">25% (Eco)</option>
-                <option value="0.5" className="bg-slate-950 text-slate-300">50% (Normal)</option>
-                <option value="0.75" className="bg-slate-950 text-slate-300">75%</option>
-                <option value="1.0" className="bg-slate-950 text-slate-300">100% (FHD)</option>
-              </select>
-            </div>
-
-            {/* Quality Selector */}
-            <div className="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs select-none">
-              <span className="text-slate-400 font-mono">Calidad:</span>
-              <select
-                value={quality}
-                onChange={(e) => setQuality(Number(e.target.value))}
-                disabled={isCapturing}
-                className="bg-transparent text-slate-100 border-none outline-none cursor-pointer focus:ring-0 font-semibold"
-              >
-                <option value="50" className="bg-slate-950 text-slate-300">50%</option>
-                <option value="65" className="bg-slate-950 text-slate-300">65%</option>
-                <option value="75" className="bg-slate-950 text-slate-300">75% (Recom.)</option>
-                <option value="85" className="bg-slate-950 text-slate-300">85%</option>
-              </select>
-            </div>
-
-            {isCapturing ? (
-              <button
-                onClick={stopCapture}
-                className="flex items-center space-x-2 px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-sm font-semibold transition shadow-glow-rose hover:scale-[1.02] active:scale-[0.98]"
-              >
-                <Square className="w-4 h-4 fill-current" />
-                <span>Detener captura</span>
-              </button>
-            ) : (
-              <button
-                onClick={startSession}
-                className="flex items-center space-x-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-sm font-semibold transition shadow-glow-cyan hover:scale-[1.02] active:scale-[0.98]"
-              >
-                <Play className="w-4 h-4 fill-current" />
-                <span>Iniciar sesión</span>
-              </button>
-            )}
-          </div>
-
-          {/* Stats Bar */}
-          <div className="flex items-center space-x-4">
-            <div className="text-right">
-              <span className="text-[10px] text-slate-400 font-mono block">SCREENSHOTS</span>
-              <span className="text-2xl font-black font-mono text-cyan-400 tracking-tight">
-                {capturedCount}
-              </span>
-            </div>
-            {isCapturing && (
-              <div className="px-3 py-1 bg-red-500/10 border border-red-500/20 rounded-full flex items-center space-x-1.5 text-xs text-red-400 font-semibold animate-pulse">
-                <span className="h-1.5 w-1.5 rounded-full bg-red-500"></span>
-                <span>3 FPS (333ms)</span>
-              </div>
-            )}
-          </div>
-        </header>
-
-        {/* Dashboard Grid Workspace */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          
-          {/* Active Browser Viewport / Webview Area */}
+          {/* Active Capture Viewport */}
           {isCapturing && (
-            <div className="border border-slate-800 rounded-2xl overflow-hidden bg-slate-900 flex flex-col h-[400px] shadow-2xl relative">
-              <div className="px-4 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between text-xs">
-                <div className="flex items-center space-x-2 text-slate-400">
-                  <span className="h-2 w-2 rounded-full bg-green-500"></span>
-                  <span className="font-mono truncate max-w-[400px]">{captureUrl || inputUrl}</span>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <div className="flex items-center space-x-1 bg-cyan-950/30 border border-cyan-800/30 px-2.5 py-0.5 rounded-full text-cyan-400 font-mono text-[10px]">
-                    <span>Pantalla: {viewportResolution === 'responsive' ? 'Adaptativo' : viewportResolution}</span>
-                  </div>
-                  <div className="flex items-center space-x-1 bg-cyan-950/30 border border-cyan-800/30 px-2.5 py-0.5 rounded-full text-cyan-400 font-mono text-[10px]">
-                    <span>Capturando...</span>
-                  </div>
-                </div>
-              </div>
-              <div ref={containerRef} className="flex-1 bg-slate-950 relative overflow-hidden">
-                {isElectron ? (
-                  // Electron Real Webview Element
-                  <webview
-                    id="embedded-browser"
-                    src={inputUrl}
-                    style={webviewStyle}
-                  ></webview>
-                ) : (
-                  // Simulated webview in standard browser
-                  <div className="absolute inset-0 bg-slate-900 flex flex-col items-center justify-center text-center p-6 select-none">
-                    <div className="w-16 h-16 rounded-full bg-cyan-500/5 flex items-center justify-center border border-cyan-500/10 mb-4 animate-bounce">
-                      <Globe className="w-8 h-8 text-cyan-400" />
-                    </div>
-                    <h3 className="text-lg font-bold text-white mb-1">Navegador Simulado Activo</h3>
-                    <p className="text-sm text-slate-400 max-w-md mb-4">
-                      Simulando navegación y capturas a 3 FPS para la URL <code className="text-cyan-400">{captureUrl}</code>.
-                    </p>
-                    <div className="inline-flex items-center px-4 py-1.5 bg-slate-950 rounded-xl border border-slate-800 font-mono text-xs text-slate-400">
-                      Navegando... Generando screenshots de prueba
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
+            <Viewport
+              isElectron={isElectron}
+              inputUrl={inputUrl}
+              captureUrl={captureUrl}
+              resolution={resolution}
+            />
           )}
 
-          {/* Section 2: Screenshots Gallery */}
-          <div>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-md font-bold tracking-tight text-white flex items-center space-x-2">
-                <ImageIcon className="w-5 h-5 text-cyan-400" />
-                <span>
-                  {isCapturing 
-                    ? 'Capturas en Tiempo Real' 
-                    : selectedSessionId 
-                      ? `Galería de Sesión (${selectedSessionId.slice(0, 8)})` 
-                      : 'Galería de Screenshots'}
-                </span>
-              </h2>
-              <span className="text-xs text-slate-400">
-                {isCapturing ? 'Mostrando las últimas 12 capturas' : `${selectedSessionScreenshots.length} capturas en total`}
-              </span>
-            </div>
-
-            {/* Gallery Grid */}
-            {isCapturing ? (
-              // Live Real-Time Gallery Stream
-              liveGallery.length === 0 ? (
-                <div className="p-12 text-center border border-dashed border-slate-800 rounded-2xl bg-slate-900/20">
-                  <Loader2 className="w-8 h-8 text-slate-600 animate-spin mx-auto mb-3" />
-                  <p className="text-sm text-slate-400">Esperando primeras capturas...</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                  {liveGallery.map((shot, idx) => (
-                    <div key={shot.id} className="group relative bg-slate-900 rounded-xl overflow-hidden border border-slate-800/80 transition duration-300 hover:border-cyan-500/50 hover:shadow-lg">
-                      <div className="aspect-[4/3] bg-slate-950 overflow-hidden relative">
-                        <img 
-                          src={shot.imagePath} 
-                          alt="Live Screenshot" 
-                          className="w-full h-full object-cover object-top transition duration-500 group-hover:scale-105" 
-                        />
-                        <div className="absolute top-1.5 left-1.5 bg-black/60 px-1.5 py-0.5 rounded font-mono text-[9px] text-cyan-400">
-                          #{idx + 1}
-                        </div>
-                      </div>
-                      <div className="p-2 border-t border-slate-800/60 bg-slate-950/80">
-                        <p className="text-[9px] text-slate-400 truncate" title={shot.url}>{shot.url}</p>
-                        <p className="text-[8px] text-slate-500 font-mono mt-0.5">
-                          {new Date(shot.timestamp).toLocaleTimeString()}
-                        </p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )
-            ) : (
-              // Historical Gallery from database
-              selectedSessionId ? (
-                selectedSessionScreenshots.length === 0 ? (
-                  <div className="p-12 text-center border border-dashed border-slate-800 rounded-2xl bg-slate-900/20">
-                    <ImageIcon className="w-8 h-8 text-slate-600 mx-auto mb-3" />
-                    <p className="text-sm text-slate-400">No se guardaron screenshots en esta sesión</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                    {selectedSessionScreenshots.map((shot, idx) => {
-                      const imageFullUrl = shot.imagePath.startsWith('data:') 
-                        ? shot.imagePath 
-                        : `${API_BASE_URL}${shot.imagePath}`
-                      return (
-                        <div key={shot.id} className="group relative bg-slate-900 rounded-xl overflow-hidden border border-slate-800/80 transition duration-300 hover:border-cyan-500/50 hover:shadow-lg">
-                          <div className="aspect-[4/3] bg-slate-950 overflow-hidden relative">
-                            <img 
-                              src={imageFullUrl} 
-                              alt="Screenshot" 
-                              className="w-full h-full object-cover object-top transition duration-500 group-hover:scale-105"
-                            />
-                            <div className="absolute top-1.5 left-1.5 bg-black/60 px-1.5 py-0.5 rounded font-mono text-[9px] text-cyan-400">
-                              #{idx + 1}
-                            </div>
-                            {/* Expand preview icon button */}
-                            <a
-                              href={imageFullUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="absolute bottom-2 right-2 p-1.5 bg-slate-950/80 hover:bg-slate-950 text-slate-300 hover:text-white rounded-lg border border-slate-800 opacity-0 group-hover:opacity-100 transition"
-                            >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                            </a>
-                          </div>
-                          <div className="p-2 border-t border-slate-800/60 bg-slate-950/80">
-                            <p className="text-[9px] text-slate-400 truncate" title={shot.url}>{shot.url}</p>
-                            <p className="text-[8px] text-slate-500 font-mono mt-0.5">
-                              {new Date(shot.timestamp).toLocaleTimeString()}
-                            </p>
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )
-              ) : (
-                // Welcome screen if no session selected
-                <div className="p-16 text-center border border-dashed border-slate-800 rounded-2xl bg-slate-900/10">
-                  <div className="w-12 h-12 rounded-full bg-slate-900 flex items-center justify-center border border-slate-800 mx-auto mb-4 text-slate-500">
-                    <ImageIcon className="w-6 h-6" />
-                  </div>
-                  <h3 className="text-sm font-semibold text-slate-300 mb-1">Ninguna sesión seleccionada</h3>
-                  <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                    Selecciona una sesión histórica en la barra lateral para ver su galería de screenshots o ingresa una URL arriba para comenzar una nueva sesión de captura.
-                  </p>
-                </div>
-              )
-            )}
-          </div>
+          {/* Screenshots Gallery */}
+          <Gallery
+            isCapturing={isCapturing}
+            liveGallery={liveGallery}
+            selectedSessionId={selectedSessionId}
+            selectedSessionScreenshots={selectedSessionScreenshots}
+          />
         </div>
       </main>
     </div>
